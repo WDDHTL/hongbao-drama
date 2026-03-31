@@ -1,0 +1,20 @@
+<svg width="800" height="520" viewBox="0 0 800 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g7" x1="400" y1="0" x2="400" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F1420"/>
+      <stop offset="1" stop-color="#2B3340"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="520" fill="url(#g7)"/>
+  <rect y="360" width="800" height="160" fill="#0A0A0D"/>
+  <rect x="102" y="138" width="86" height="222" fill="#1C2230"/>
+  <rect x="218" y="112" width="118" height="248" fill="#222B39"/>
+  <rect x="368" y="90" width="76" height="270" fill="#181D28"/>
+  <rect x="474" y="134" width="96" height="226" fill="#212938"/>
+  <rect x="602" y="104" width="112" height="256" fill="#2A3242"/>
+  <path d="M0 414H800" stroke="#6A7487" stroke-width="4" stroke-dasharray="30 26"/>
+  <path d="M224 150H300" stroke="#6BF0FF" stroke-width="6"/>
+  <path d="M490 190H554" stroke="#A06BFF" stroke-width="6"/>
+  <path d="M620 160H694" stroke="#FF5B8F" stroke-width="6"/>
+  <text x="40" y="468" fill="#F2F4F8" font-family="Arial, sans-serif" font-size="34" font-weight="700">URBAN</text>
+</svg>

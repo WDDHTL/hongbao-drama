@@ -1,0 +1,14 @@
+<svg width="800" height="520" viewBox="0 0 800 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="800" height="520" fill="#BCE9FF"/>
+  <path d="M0 352H800V520H0V352Z" fill="#87C56F"/>
+  <path d="M144 260L220 220L296 260L220 300L144 260Z" fill="#B98D5A"/>
+  <path d="M144 260V340L220 380V300L144 260Z" fill="#8E6A42"/>
+  <path d="M220 300V380L296 340V260L220 300Z" fill="#A97C4D"/>
+  <path d="M388 188L490 136L592 188L490 240L388 188Z" fill="#63A95D"/>
+  <path d="M388 188V320L490 372V240L388 188Z" fill="#4E8448"/>
+  <path d="M490 240V372L592 320V188L490 240Z" fill="#5A9753"/>
+  <path d="M580 264L650 226L720 264L650 302L580 264Z" fill="#D9D3C6"/>
+  <path d="M580 264V350L650 388V302L580 264Z" fill="#BEB6A7"/>
+  <path d="M650 302V388L720 350V264L650 302Z" fill="#CDC5B6"/>
+  <text x="40" y="468" fill="#122112" font-family="Arial, sans-serif" font-size="34" font-weight="700">VOXEL</text>
+</svg>

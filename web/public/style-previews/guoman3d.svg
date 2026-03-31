@@ -1,0 +1,17 @@
+<svg width="800" height="520" viewBox="0 0 800 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g8" x1="116" y1="44" x2="690" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#21305B"/>
+      <stop offset="1" stop-color="#5D1E56"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="520" fill="url(#g8)"/>
+  <circle cx="626" cy="106" r="40" fill="#FFF1B4"/>
+  <path d="M0 398C116 354 196 328 316 332C450 336 594 308 800 248V520H0V398Z" fill="#18233D"/>
+  <path d="M184 330L286 160L354 268L436 126L544 330H184Z" fill="#D7A4FF"/>
+  <path d="M258 330L286 252L318 330H258Z" fill="#FFF5FF"/>
+  <path d="M422 330L436 220L452 330H422Z" fill="#FFF5FF"/>
+  <path d="M530 330L544 268L560 330H530Z" fill="#FFF5FF"/>
+  <path d="M332 208H530" stroke="#7DE8FF" stroke-width="8" stroke-linecap="round"/>
+  <text x="40" y="468" fill="#F7F4FF" font-family="Arial, sans-serif" font-size="34" font-weight="700">GUOMAN 3D</text>
+</svg>

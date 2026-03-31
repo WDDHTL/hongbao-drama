@@ -1,0 +1,18 @@
+<svg width="800" height="520" viewBox="0 0 800 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g4" x1="114" y1="54" x2="680" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#35514B"/>
+      <stop offset="1" stop-color="#C9975B"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="520" fill="url(#g4)"/>
+  <rect x="168" y="116" width="464" height="292" rx="18" fill="#2E2C34"/>
+  <rect x="198" y="146" width="404" height="220" rx="10" fill="#C88746"/>
+  <rect x="220" y="168" width="360" height="176" rx="8" fill="#F0C88B"/>
+  <circle cx="306" cy="252" r="58" fill="#F6E6C6"/>
+  <rect x="430" y="206" width="92" height="92" rx="10" fill="#5A6A66"/>
+  <rect x="436" y="212" width="80" height="18" fill="#8AA39C"/>
+  <circle cx="466" cy="268" r="26" fill="#D4E3D9"/>
+  <rect x="352" y="388" width="96" height="18" rx="9" fill="#D9D2C5"/>
+  <text x="40" y="468" fill="#F4E6CF" font-family="Arial, sans-serif" font-size="34" font-weight="700">NOSTALGIA</text>
+</svg>

@@ -16,6 +16,10 @@
           </div>
         </template>
         <template #right>
+          <el-button type="primary" class="action-btn" @click="goToVideoIdeaTab">
+            <el-icon><VideoCamera /></el-icon>
+            <span>{{ $t("drama.management.videoIdea") }}</span>
+          </el-button>
           <el-button type="primary" plain @click="goToAutoWorkflow">
             自动工作流
           </el-button>
@@ -121,6 +125,68 @@
                 </el-descriptions-item>
               </el-descriptions>
             </el-card>
+          </el-tab-pane>
+
+          <!-- 对话生成视频 -->
+          <el-tab-pane :label="$t('drama.management.videoIdea')" name="videoIdea">
+            <div class="video-idea-wrapper">
+              <div class="video-idea-hero">
+                <div>
+                  <div class="video-idea-kicker">{{ $t("drama.management.videoIdeaKicker") }}</div>
+                  <h2 class="video-idea-title">{{ $t("drama.management.videoIdeaTitle") }}</h2>
+                  <p class="video-idea-desc">
+                    {{ $t("drama.management.videoIdeaGuideDesc") }}
+                  </p>
+                </div>
+                <div class="video-idea-tags">
+                  <el-tag type="success" effect="dark">{{ $t("drama.management.videoIdeaTagScript") }}</el-tag>
+                  <el-tag type="warning" effect="dark">{{ $t("drama.management.videoIdeaTagAuto") }}</el-tag>
+                  <el-tag type="info" effect="dark">{{ $t("drama.management.videoIdeaTagWorkflow") }}</el-tag>
+                </div>
+              </div>
+
+              <el-card shadow="never" class="video-idea-card">
+                <template #header>
+                  <div class="card-header">
+                    <h3 class="card-title">{{ $t("drama.management.videoIdeaActionTitle") }}</h3>
+                    <span class="video-idea-subtitle">{{ $t("drama.management.videoIdeaActionSubTitle") }}</span>
+                  </div>
+                </template>
+                <div class="video-idea-form">
+                  <el-input
+                    v-model="videoIdeaInput"
+                    type="textarea"
+                    :rows="8"
+                    :placeholder="$t('drama.management.videoIdeaPlaceholder')"
+                  />
+                  <div class="video-idea-actions">
+                    <el-button
+                      type="primary"
+                      size="large"
+                      :loading="videoIdeaSubmitting"
+                      @click="submitVideoIdea"
+                    >
+                      {{ $t("drama.management.videoIdeaSubmit") }}
+                    </el-button>
+                    <el-button link type="primary" @click="goToAutoWorkflow">
+                      {{ $t("drama.management.videoIdeaWorkflowLink") }}
+                    </el-button>
+                  </div>
+                  <div class="video-idea-tip">
+                    <el-icon><VideoCamera /></el-icon>
+                    <span>{{ $t("drama.management.videoIdeaTip") }}</span>
+                  </div>
+                  <div v-if="videoIdeaResponse" class="video-idea-response">
+                    <el-alert
+                      :title="videoIdeaResponse"
+                      :type="videoIdeaResponse === '做不到' ? 'warning' : 'success'"
+                      :closable="false"
+                      show-icon
+                    />
+                  </div>
+                </div>
+              </el-card>
+            </div>
           </el-tab-pane>
 
           <!-- 章节管理 -->
@@ -775,6 +841,7 @@
         </el-tabs>
       </div>
 
+
       <!-- 添加/编辑角色对话框 -->
       <el-dialog
         v-model="addCharacterDialogVisible"
@@ -1168,6 +1235,7 @@
 import { ref, computed, onMounted, watch, onUnmounted } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
+import { useI18n } from "vue-i18n";
 import {
   ArrowLeft,
   Document,
@@ -1175,12 +1243,14 @@ import {
   Picture,
   Plus,
   Box,
+  VideoCamera,
 } from "@element-plus/icons-vue";
 import { dramaAPI } from "@/api/drama";
 import { characterLibraryAPI } from "@/api/character-library";
 import { imageAPI } from "@/api/image";
 import { propAPI } from "@/api/prop";
 import { taskAPI } from "@/api/task";
+import { workflowAPI } from "@/api/workflow";
 import type { Drama } from "@/types/drama";
 import {
   AppHeader,
@@ -1192,6 +1262,7 @@ import { fixImageUrl, getImageUrl, hasImage } from "@/utils/image";
 
 const router = useRouter();
 const route = useRoute();
+const { t } = useI18n();
 
 const drama = ref<Drama>();
 const activeTab = ref((route.query.tab as string) || "overview");
@@ -1225,6 +1296,9 @@ const extractingCharactersMessage = ref("正在提交角色提取任务...");
 const characterPreviewDialogVisible = ref(false);
 const characterPreviewImage = ref("");
 const characterPreviewTitle = ref("");
+const videoIdeaInput = ref("");
+const videoIdeaResponse = ref("");
+const videoIdeaSubmitting = ref(false);
 
 const editingCharacter = ref<any>(null);
 const editingScene = ref<any>(null);
@@ -1988,6 +2062,88 @@ const goToAutoWorkflow = () => {
   });
 };
 
+const goToVideoIdeaTab = () => {
+  activeTab.value = "videoIdea";
+  videoIdeaResponse.value = "";
+  router.replace({
+    name: route.name as string,
+    params: route.params,
+    query: {
+      ...route.query,
+      tab: "videoIdea",
+    },
+  });
+};
+
+const isVideoIntent = (message: string) => {
+  const normalized = message.trim().toLowerCase();
+  if (!normalized) return false;
+
+  const blockedKeywords = ["聊天", "闲聊", "聊天吗", "天气", "百科", "搜索", "问答", "查找", "search", "google", "百度"];
+  if (blockedKeywords.some((keyword) => normalized.includes(keyword))) {
+    return false;
+  }
+
+  const allowedKeywords = [
+    "视频",
+    "短剧",
+    "剧本",
+    "脚本",
+    "剧情",
+    "故事",
+    "分镜",
+    "场景",
+    "角色",
+    "video",
+    "movie",
+    "clip",
+  ];
+
+  return allowedKeywords.some((keyword) => normalized.includes(keyword));
+};
+
+const submitVideoIdea = async () => {
+  const content = videoIdeaInput.value.trim();
+  if (!content) {
+    ElMessage.warning("请输入你的剧本或视频想法");
+    return;
+  }
+
+  if (!isVideoIntent(content)) {
+    videoIdeaResponse.value = "做不到";
+    return;
+  }
+
+  if (!drama.value?.id) {
+    ElMessage.error("项目数据未加载完成");
+    return;
+  }
+
+  videoIdeaSubmitting.value = true;
+  videoIdeaResponse.value = "";
+
+  try {
+    const metadataPayload = {
+      ...(drama.value.metadata || {}),
+      full_script: content,
+    };
+
+    await dramaAPI.update(drama.value.id, {
+      metadata: metadataPayload,
+    });
+
+    await workflowAPI.startProjectWorkflow(drama.value.id);
+    videoIdeaResponse.value = "已提交脚本并启动自动化生成，请在自动工作流查看进度。";
+    ElMessage.success("已提交脚本并启动自动化生成");
+    goToAutoWorkflow();
+  } catch (error: any) {
+    const message = error?.message || "提交失败";
+    videoIdeaResponse.value = message;
+    ElMessage.error(message);
+  } finally {
+    videoIdeaSubmitting.value = false;
+  }
+};
 const createNewEpisode = () => {
   const nextEpisodeNumber = episodesCount.value + 1;
   router.push({
@@ -2701,6 +2857,21 @@ const handleExtractProps = async () => {
   }
 };
 
+watch(
+  activeTab,
+  (tab) => {
+    router.replace({
+      name: route.name as string,
+      params: route.params,
+      query: {
+        ...route.query,
+        tab,
+      },
+    });
+  },
+  { flush: "post" },
+);
+
 onMounted(() => {
   loadDramaData();
   loadScenes();
@@ -2738,6 +2909,95 @@ onMounted(() => {
 .content-wrapper {
   margin: 0 auto;
   width: 100%;
+}
+
+.action-btn {
+  margin-right: 12px;
+}
+
+.video-idea-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-top: 4px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: 1px dashed var(--border-primary);
+  border-radius: var(--radius-md);
+}
+
+.video-idea-response {
+  margin-top: 12px;
+}
+
+.video-idea-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.video-idea-hero {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-lg);
+  background: var(--bg-secondary);
+}
+
+.video-idea-kicker {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.video-idea-title {
+  margin: 4px 0 8px;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.video-idea-desc {
+  margin: 0;
+  max-width: 760px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.video-idea-tags {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.video-idea-card {
+  border-radius: var(--radius-lg);
+}
+
+.video-idea-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.video-idea-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.video-idea-subtitle {
+  color: var(--text-secondary);
+  font-weight: 400;
+  font-size: 0.95rem;
 }
 
 /* ========================================

@@ -10,7 +10,15 @@ export const workflowAPI = {
     return request.post<WorkflowRun>(`/dramas/${dramaId}/workflow/start`)
   },
 
+  pauseProjectWorkflow(dramaId: string) {
+    return request.post<WorkflowRun>(`/dramas/${dramaId}/workflow/pause`)
+  },
+
   resumeProjectWorkflow(dramaId: string) {
     return request.post<WorkflowRun>(`/dramas/${dramaId}/workflow/resume`)
+  },
+
+  retryEpisodeVideo(dramaId: string, data: { episode_id: number; model: string }) {
+    return request.post(`/dramas/${dramaId}/workflow/retry-video`, data)
   }
 }

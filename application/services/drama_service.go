@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/drama-generator/backend/domain/models"
 	"github.com/drama-generator/backend/pkg/config"
 	"github.com/drama-generator/backend/pkg/logger"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
 
@@ -28,22 +30,60 @@ func NewDramaService(db *gorm.DB, cfg *config.Config, log *logger.Logger) *Drama
 }
 
 type CreateDramaRequest struct {
-	Title         string `json:"title" binding:"required,min=1,max=100"`
-	Description   string `json:"description"`
-	Genre         string `json:"genre"`
-	Style         string `json:"style"`
-	VideoLanguage string `json:"video_language"`
-	Tags          string `json:"tags"`
+	Title         string                 `json:"title" binding:"required,min=1,max=100"`
+	Description   string                 `json:"description"`
+	Genre         string                 `json:"genre"`
+	Style         string                 `json:"style"`
+	VideoLanguage string                 `json:"video_language"`
+	Tags          string                 `json:"tags"`
+	Metadata      map[string]interface{} `json:"metadata"`
 }
 
 type UpdateDramaRequest struct {
-	Title         string `json:"title" binding:"omitempty,min=1,max=100"`
-	Description   string `json:"description"`
-	Genre         string `json:"genre"`
-	Style         string `json:"style"`
-	VideoLanguage string `json:"video_language"`
-	Tags          string `json:"tags"`
-	Status        string `json:"status" binding:"omitempty,oneof=draft planning production completed archived"`
+	Title         string                 `json:"title" binding:"omitempty,min=1,max=100"`
+	Description   string                 `json:"description"`
+	Genre         string                 `json:"genre"`
+	Style         string                 `json:"style"`
+	VideoLanguage string                 `json:"video_language"`
+	Tags          string                 `json:"tags"`
+	Status        string                 `json:"status" binding:"omitempty,oneof=draft planning production completed archived"`
+	Metadata      map[string]interface{} `json:"metadata"`
+}
+
+const maxScriptLength = 20000
+
+func IsVideoIntent(content string) bool {
+	normalized := strings.TrimSpace(strings.ToLower(content))
+	if normalized == "" {
+		return false
+	}
+
+	blockedKeywords := []string{"聊天", "闲聊", "天气", "百科", "搜索", "问答", "查找", "search", "google", "百度"}
+	for _, keyword := range blockedKeywords {
+		if strings.Contains(content, keyword) || strings.Contains(normalized, keyword) {
+			return false
+		}
+	}
+
+	allowedKeywords := []string{"视频", "短剧", "剧本", "脚本", "剧情", "故事", "分镜", "场景", "角色", "video", "movie", "clip"}
+	for _, keyword := range allowedKeywords {
+		if strings.Contains(content, keyword) || strings.Contains(normalized, keyword) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func ValidateVideoScript(content string) (string, error) {
+	trimmed := strings.TrimSpace(content)
+	if len([]rune(trimmed)) > maxScriptLength {
+		return "", fmt.Errorf("脚本文字过长，限制%d字符", maxScriptLength)
+	}
+	if trimmed != "" && !IsVideoIntent(trimmed) {
+		return "", errors.New("仅支持视频/剧本相关内容，请不要输入聊天或搜索需求")
+	}
+	return trimmed, nil
 }
 
 type DramaListQuery struct {
@@ -73,6 +113,26 @@ func (s *DramaService) CreateDrama(req *CreateDramaRequest) (*models.Drama, erro
 	}
 	if req.VideoLanguage != "" {
 		drama.VideoLanguage = req.VideoLanguage
+	}
+	if len(req.Metadata) > 0 {
+		if raw, ok := req.Metadata["full_script"]; ok {
+			if script, ok := raw.(string); ok {
+				normalized, err := ValidateVideoScript(script)
+				if err != nil {
+					return nil, err
+				}
+				if normalized == "" {
+					delete(req.Metadata, "full_script")
+				} else {
+					req.Metadata["full_script"] = normalized
+				}
+			}
+		}
+		metadataBytes, err := json.Marshal(req.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		drama.Metadata = datatypes.JSON(metadataBytes)
 	}
 
 	if err := s.db.Create(drama).Error; err != nil {
@@ -294,11 +354,37 @@ func (s *DramaService) UpdateDrama(dramaID string, req *UpdateDramaRequest) (*mo
 	if req.Status != "" {
 		updates["status"] = req.Status
 	}
+	if req.Metadata != nil {
+		metadata := req.Metadata
+		if raw, ok := metadata["full_script"]; ok {
+			if script, ok := raw.(string); ok {
+				normalized, err := ValidateVideoScript(script)
+				if err != nil {
+					return nil, err
+				}
+				if normalized == "" {
+					delete(metadata, "full_script")
+				} else {
+					metadata["full_script"] = normalized
+				}
+			}
+		}
+		metadataBytes, err := json.Marshal(metadata)
+		if err != nil {
+			return nil, err
+		}
+		updates["metadata"] = datatypes.JSON(metadataBytes)
+	}
 
 	updates["updated_at"] = time.Now()
 
 	if err := s.db.Model(&drama).Updates(updates).Error; err != nil {
 		s.log.Errorw("Failed to update drama", "error", err)
+		return nil, err
+	}
+
+	// 重新查询最新数据，确保返回的 Metadata 等字段是最新的
+	if err := s.db.Where("id = ? ", dramaID).First(&drama).Error; err != nil {
 		return nil, err
 	}
 

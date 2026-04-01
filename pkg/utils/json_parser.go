@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -62,13 +63,20 @@ func SafeParseAIJSON(aiResponse string, v interface{}) error {
 	}
 
 	// 3. 尝试解析JSON
+	// 3.1 先尝试直接解析
 	err := json.Unmarshal([]byte(jsonMatch), v)
 	if err == nil {
 		return nil // 解析成功
 	}
 
+	// 3.2 尝试修复常见的无引号字符串问题后再解析
+	fixedJSON := fixUnquotedStrings(jsonMatch)
+	if err := json.Unmarshal([]byte(fixedJSON), v); err == nil {
+		return nil
+	}
+
 	// 4. 如果解析失败，尝试修复截断的JSON
-	fixedJSON := attemptJSONRepair(jsonMatch)
+	fixedJSON = attemptJSONRepair(fixedJSON)
 	if fixedJSON != jsonMatch {
 		if err := json.Unmarshal([]byte(fixedJSON), v); err == nil {
 			return nil // 修复后解析成功
@@ -103,6 +111,40 @@ func SafeParseAIJSON(aiResponse string, v interface{}) error {
 	}
 
 	return fmt.Errorf("JSON解析失败: %w\n原始响应: %s", err, truncateString(jsonMatch, 300))
+}
+
+// fixUnquotedStrings 为常见的未加引号的字符串值补充引号，方便容错解析
+// unquotedValueRegex 匹配未加引号的简单 value（避免使用 Go RE2 不支持的前瞻）
+var unquotedValueRegex = regexp.MustCompile(`(:\s*)([^\{\[\]",][^,\}\]]*)([,}])`)
+
+func fixUnquotedStrings(jsonStr string) string {
+	return unquotedValueRegex.ReplaceAllStringFunc(jsonStr, func(match string) string {
+		parts := unquotedValueRegex.FindStringSubmatch(match)
+		if len(parts) < 4 {
+			return match
+		}
+		prefix := parts[1]
+		value := strings.TrimSpace(parts[2])
+		suffix := parts[3]
+
+		// 已有引号或对象/数组/布尔/数字/null 不处理
+		if value == "" ||
+			strings.HasPrefix(value, `"`) ||
+			strings.HasPrefix(value, "{") ||
+			strings.HasPrefix(value, "[") {
+			return match
+		}
+		lower := strings.ToLower(value)
+		if lower == "true" || lower == "false" || lower == "null" {
+			return match
+		}
+		if _, err := strconv.ParseFloat(value, 64); err == nil {
+			return match
+		}
+
+		escaped := strings.ReplaceAll(value, `"`, `\"`)
+		return fmt.Sprintf(`%s"%s"%s`, prefix, escaped, suffix)
+	})
 }
 
 // attemptJSONRepair 尝试修复常见的JSON问题

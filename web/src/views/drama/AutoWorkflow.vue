@@ -15,8 +15,8 @@
         <el-button :loading="starting" type="primary" @click="startWorkflow">
           开始自动生成
         </el-button>
-        <el-button v-if="canResume" :loading="resuming" @click="resumeWorkflow">
-          继续执行
+        <el-button v-if="canTogglePause" :loading="pauseOrResumeLoading" @click="togglePauseOrResume">
+          {{ pauseOrResumeLabel }}
         </el-button>
       </template>
     </AppHeader>
@@ -163,6 +163,30 @@
           </div>
         </div>
       </section>
+
+      <el-dialog v-model="modelDialogVisible" title="模型异常，请切换模型" width="520px">
+        <p class="dialog-reason">
+          {{ modelDialogData?.reason || '当前模型不可用，请前往 AI 配置切换后再继续。' }}
+        </p>
+        <el-alert
+          v-if="modelDialogData?.provider || modelDialogData?.model"
+          :title="`当前模型：${modelDialogData?.provider || ''} / ${modelDialogData?.model || ''}`"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="mb-12"
+        />
+        <p class="text-muted">
+          请选择在 AI 配置中切换可用的视频模型，然后返回点击“继续执行”，系统将使用最新配置重试。
+        </p>
+        <template #footer>
+          <el-button @click="modelDialogVisible = false">稍后再说</el-button>
+          <el-button type="primary" @click="openAIConfig">前往 AI 配置</el-button>
+          <el-button type="success" @click="continueAfterModelChange">
+            我已切换，继续执行
+          </el-button>
+        </template>
+      </el-dialog>
     </div>
   </div>
 </template>
@@ -185,8 +209,18 @@ const dramaId = route.params.id as string
 const drama = ref<Drama | null>(null)
 const loading = ref(false)
 const starting = ref(false)
-const resuming = ref(false)
+const pauseOrResumeLoading = ref(false)
 const pollTimer = ref<number | null>(null)
+
+const modelDialogVisible = ref(false)
+const modelDialogData = ref<{
+  reason?: string
+  available_models?: string[]
+  fallback_models?: string[]
+  provider?: string
+  model?: string
+  episode_id?: number
+} | null>(null)
 
 const status = ref<WorkflowStatusResponse>({
   run: null,
@@ -206,9 +240,18 @@ const stageOrder = [
   { key: 'episode_merge', label: '自动合成' },
 ]
 
-const canResume = computed(
-  () => status.value.run?.status === 'failed' || status.value.run?.status === 'paused',
-)
+const canTogglePause = computed(() => {
+  const value = status.value.run?.status
+  if (!value) return false
+  return value !== 'completed'
+})
+
+const pauseOrResumeLabel = computed(() => {
+  const value = status.value.run?.status
+  if (value === 'paused') return '继续生成'
+  if (value === 'failed') return '重新执行'
+  return '暂停生成'
+})
 
 const progressStatus = computed(() => {
   if (status.value.run?.status === 'failed') return 'exception'
@@ -226,6 +269,7 @@ const loadWorkflowStatus = async (silent = false) => {
   if (!silent) loading.value = true
   try {
     status.value = await workflowAPI.getProjectWorkflowStatus(dramaId)
+    checkModelConfirmationNeeded()
   } finally {
     loading.value = false
   }
@@ -262,17 +306,27 @@ const startWorkflow = async () => {
   }
 }
 
-const resumeWorkflow = async () => {
-  resuming.value = true
+const togglePauseOrResume = async () => {
+  if (!status.value.run) return
+  const currentStatus = status.value.run.status
+  pauseOrResumeLoading.value = true
   try {
-    await workflowAPI.resumeProjectWorkflow(dramaId)
-    await loadWorkflowStatus(true)
-    startPolling()
-    ElMessage.success('自动工作流已继续执行')
+    if (currentStatus === 'paused' || currentStatus === 'failed') {
+      await workflowAPI.resumeProjectWorkflow(dramaId)
+      await loadWorkflowStatus(true)
+      startPolling()
+      ElMessage.success('自动工作流已继续执行')
+    } else {
+      await workflowAPI.pauseProjectWorkflow(dramaId)
+      await loadWorkflowStatus(true)
+      stopPolling()
+      ElMessage.success('自动工作流已暂停')
+    }
   } catch (error: any) {
-    ElMessage.error(error?.message || '继续执行失败')
+    const fallback = currentStatus === 'paused' || currentStatus === 'failed' ? '继续执行失败' : '暂停失败'
+    ElMessage.error(error?.message || fallback)
   } finally {
-    resuming.value = false
+    pauseOrResumeLoading.value = false
   }
 }
 
@@ -341,6 +395,46 @@ const formatTime = (value?: string) => {
   if (!value) return '--'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+const checkModelConfirmationNeeded = () => {
+  // 仅在运行状态为 paused 时弹窗，避免处理中旧的 paused 步骤反复触发
+  if (status.value.run?.status !== 'paused') {
+    modelDialogVisible.value = false
+    return
+  }
+
+  const runMeta = status.value.run?.result_json || {}
+  const runNeedsConfirm = runMeta.requires_confirmation
+
+  // 找到最新的 paused 步骤（限 paused 状态）
+  const stepNeedsConfirm = status.value.steps
+    .filter((step) => step.status === 'paused' && step.meta_json?.requires_confirmation)
+    .sort((a, b) => b.id - a.id)
+    .at(0)
+
+  if (runNeedsConfirm || stepNeedsConfirm) {
+    const payload = (stepNeedsConfirm?.meta_json || runMeta) as any
+    modelDialogData.value = payload
+    modelDialogVisible.value = true
+  } else {
+    modelDialogVisible.value = false
+  }
+}
+
+const openAIConfig = () => {
+  router.push('/settings/ai-config')
+}
+
+const continueAfterModelChange = async () => {
+  try {
+    // 直接恢复/重试，后端会按最新配置的默认模型执行
+    await togglePauseOrResume()
+    ElMessage.success('已继续执行，将使用最新 AI 配置')
+    modelDialogVisible.value = false
+  } catch (error: any) {
+    ElMessage.error(error?.message || '继续执行失败')
+  }
 }
 
 onMounted(async () => {

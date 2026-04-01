@@ -29,6 +29,8 @@ const (
 	workflowStageCompleted         = "completed"
 )
 
+var errWorkflowPaused = errors.New("workflow paused by user")
+
 type WorkflowEpisodeSummary struct {
 	EpisodeID         uint   `json:"episode_id"`
 	EpisodeNumber     int    `json:"episode_number"`
@@ -82,6 +84,16 @@ type AutoWorkflowService struct {
 	videoMergeService *VideoMergeService
 	characterService  *CharacterLibraryService
 	propService       *PropService
+}
+
+type modelSwitchRequest struct {
+	Provider       string   `json:"provider"`
+	Model          string   `json:"model"`
+	FallbackModels []string `json:"fallback_models"`
+	Reason         string   `json:"reason"`
+	EpisodeID      uint     `json:"episode_id"`
+	Stage          string   `json:"stage"`
+	Available      []string `json:"available_models,omitempty"`
 }
 
 func NewAutoWorkflowService(db *gorm.DB, cfg *config.Config, transferService *ResourceTransferService, localStorage *storage.LocalStorage, log *logger.Logger) *AutoWorkflowService {
@@ -181,6 +193,42 @@ func (s *AutoWorkflowService) ResumeProjectWorkflow(dramaID string) (*models.Wor
 	return &run, nil
 }
 
+func (s *AutoWorkflowService) PauseProjectWorkflow(dramaID string) (*models.WorkflowRun, error) {
+	drama, err := s.dramaService.GetDrama(dramaID)
+	if err != nil {
+		return nil, err
+	}
+
+	var run models.WorkflowRun
+	if err := s.db.
+		Where("drama_id = ? AND scope = ?", drama.ID, models.WorkflowRunScopeProject).
+		Order("created_at DESC").
+		First(&run).Error; err != nil {
+		return nil, err
+	}
+
+	if run.Status == models.WorkflowRunStatusCompleted || run.Status == models.WorkflowRunStatusFailed {
+		return &run, nil
+	}
+	if run.Status == models.WorkflowRunStatusPaused {
+		return &run, nil
+	}
+
+	now := time.Now()
+	if err := s.db.Model(&models.WorkflowRun{}).Where("id = ?", run.ID).Updates(map[string]interface{}{
+		"status":        models.WorkflowRunStatusPaused,
+		"current_stage": run.CurrentStage,
+		"updated_at":    now,
+	}).Error; err != nil {
+		return nil, err
+	}
+
+	s.pauseActiveSteps(run.ID, run.CurrentStage, nil, run.Progress, "Paused by user")
+	run.Status = models.WorkflowRunStatusPaused
+	run.UpdatedAt = now
+	return &run, nil
+}
+
 func (s *AutoWorkflowService) GetProjectWorkflowStatus(dramaID string) (*WorkflowStatusResponse, error) {
 	drama, err := s.dramaService.GetDrama(dramaID)
 	if err != nil {
@@ -221,6 +269,14 @@ func (s *AutoWorkflowService) processProjectWorkflow(runID uint) {
 
 	s.updateRun(runID, models.WorkflowRunStatusProcessing, workflowStagePrepareEpisodes, 2, "", nil)
 
+	if err := s.ensureNotPaused(runID, workflowStagePrepareEpisodes, nil); err != nil {
+		if errors.Is(err, errWorkflowPaused) {
+			return
+		}
+		s.failRun(runID, workflowStagePrepareEpisodes, err, nil)
+		return
+	}
+
 	episodes, err := s.ensureEpisodes(run.DramaID)
 	if err != nil {
 		s.failRun(runID, workflowStagePrepareEpisodes, err, nil)
@@ -229,18 +285,30 @@ func (s *AutoWorkflowService) processProjectWorkflow(runID uint) {
 	s.completeStage(runID, nil, workflowStagePrepareEpisodes, "Episodes prepared", map[string]interface{}{"episodes": len(episodes)})
 
 	if err := s.runCharacterExtractionStage(runID, run.DramaID, episodes); err != nil {
+		if errors.Is(err, errWorkflowPaused) {
+			return
+		}
 		s.failRun(runID, workflowStageCharacterExtract, err, nil)
 		return
 	}
 	if err := s.runSceneExtractionStage(runID, run.DramaID, episodes); err != nil {
+		if errors.Is(err, errWorkflowPaused) {
+			return
+		}
 		s.failRun(runID, workflowStageSceneExtract, err, nil)
 		return
 	}
 	if err := s.runPropExtractionStage(runID, run.DramaID, episodes); err != nil {
+		if errors.Is(err, errWorkflowPaused) {
+			return
+		}
 		s.failRun(runID, workflowStagePropExtract, err, nil)
 		return
 	}
 	if err := s.runCharacterBaselineStage(runID, run.DramaID); err != nil {
+		if errors.Is(err, errWorkflowPaused) {
+			return
+		}
 		s.failRun(runID, workflowStageCharacterBaseline, err, nil)
 		return
 	}
@@ -253,6 +321,9 @@ func (s *AutoWorkflowService) processProjectWorkflow(runID uint) {
 	for index := range episodes {
 		if err := s.runEpisodeStages(runID, &episodes[index], index, totalEpisodes); err != nil {
 			var stageErr *workflowStageError
+			if errors.Is(err, errWorkflowPaused) {
+				return
+			}
 			if errors.As(err, &stageErr) {
 				s.failRun(runID, stageErr.Stage, stageErr.Err, stageErr.EpisodeID)
 			} else {
@@ -293,6 +364,9 @@ func (s *AutoWorkflowService) runExtractionStages(runID uint, dramaID uint, epis
 }
 
 func (s *AutoWorkflowService) runCharacterExtractionStage(runID uint, dramaID uint, episodes []models.Episode) error {
+	if err := s.ensureNotPaused(runID, workflowStageCharacterExtract, nil); err != nil {
+		return err
+	}
 	var characterCount int64
 	if err := s.db.Model(&models.Character{}).Where("drama_id = ?", dramaID).Count(&characterCount).Error; err != nil {
 		return err
@@ -315,7 +389,7 @@ func (s *AutoWorkflowService) runCharacterExtractionStage(runID uint, dramaID ui
 	}
 
 	for _, taskID := range taskIDs {
-		task, err := s.waitForAsyncTask(taskID, 10*time.Minute)
+		task, err := s.waitForAsyncTask(taskID, 10*time.Minute, runID, workflowStageCharacterExtract, nil)
 		if err != nil {
 			return err
 		}
@@ -332,6 +406,9 @@ func (s *AutoWorkflowService) runCharacterExtractionStage(runID uint, dramaID ui
 }
 
 func (s *AutoWorkflowService) runSceneExtractionStage(runID uint, dramaID uint, episodes []models.Episode) error {
+	if err := s.ensureNotPaused(runID, workflowStageSceneExtract, nil); err != nil {
+		return err
+	}
 	var sceneCount int64
 	if err := s.db.Model(&models.Scene{}).Where("drama_id = ?", dramaID).Count(&sceneCount).Error; err != nil {
 		return err
@@ -354,7 +431,7 @@ func (s *AutoWorkflowService) runSceneExtractionStage(runID uint, dramaID uint, 
 	}
 
 	for _, taskID := range taskIDs {
-		task, err := s.waitForAsyncTask(taskID, 10*time.Minute)
+		task, err := s.waitForAsyncTask(taskID, 10*time.Minute, runID, workflowStageSceneExtract, nil)
 		if err != nil {
 			return err
 		}
@@ -371,6 +448,9 @@ func (s *AutoWorkflowService) runSceneExtractionStage(runID uint, dramaID uint, 
 }
 
 func (s *AutoWorkflowService) runPropExtractionStage(runID uint, dramaID uint, episodes []models.Episode) error {
+	if err := s.ensureNotPaused(runID, workflowStagePropExtract, nil); err != nil {
+		return err
+	}
 	var propCount int64
 	if err := s.db.Model(&models.Prop{}).Where("drama_id = ?", dramaID).Count(&propCount).Error; err != nil {
 		return err
@@ -392,7 +472,7 @@ func (s *AutoWorkflowService) runPropExtractionStage(runID uint, dramaID uint, e
 	}
 
 	for _, taskID := range taskIDs {
-		task, err := s.waitForAsyncTask(taskID, 10*time.Minute)
+		task, err := s.waitForAsyncTask(taskID, 10*time.Minute, runID, workflowStagePropExtract, nil)
 		if err != nil {
 			return err
 		}
@@ -408,6 +488,9 @@ func (s *AutoWorkflowService) runPropExtractionStage(runID uint, dramaID uint, e
 }
 
 func (s *AutoWorkflowService) runCharacterBaselineStage(runID uint, dramaID uint) error {
+	if err := s.ensureNotPaused(runID, workflowStageCharacterBaseline, nil); err != nil {
+		return err
+	}
 	s.updateRun(runID, models.WorkflowRunStatusProcessing, workflowStageCharacterBaseline, 34, "", nil)
 	s.updateStep(runID, nil, workflowStageCharacterBaseline, models.WorkflowRunStatusProcessing, 5, "Checking character baseline images", nil, nil)
 
@@ -438,7 +521,7 @@ func (s *AutoWorkflowService) runCharacterBaselineStage(runID uint, dramaID uint
 		}
 	}
 
-	if err := s.waitForCharacterBaselines(dramaID, 20*time.Minute); err != nil {
+	if err := s.waitForCharacterBaselines(dramaID, 20*time.Minute, runID, workflowStageCharacterBaseline); err != nil {
 		return err
 	}
 
@@ -469,6 +552,9 @@ func (s *AutoWorkflowService) runEpisodeStages(runID uint, episode *models.Episo
 
 func (s *AutoWorkflowService) runEpisodeStoryboardStage(runID uint, episode *models.Episode, progress int) error {
 	stage := workflowStageStoryboard
+	if err := s.ensureNotPaused(runID, stage, &episode.ID); err != nil {
+		return err
+	}
 	s.updateRun(runID, models.WorkflowRunStatusProcessing, s.stageWithEpisodeNumber(stage, episode.EpisodeNum), progress, "", nil)
 
 	var storyboardCount int64
@@ -486,7 +572,7 @@ func (s *AutoWorkflowService) runEpisodeStoryboardStage(runID uint, episode *mod
 		return err
 	}
 
-	task, err := s.waitForAsyncTask(taskID, 15*time.Minute)
+	task, err := s.waitForAsyncTask(taskID, 15*time.Minute, runID, stage, &episode.ID)
 	if err != nil {
 		return err
 	}
@@ -500,6 +586,9 @@ func (s *AutoWorkflowService) runEpisodeStoryboardStage(runID uint, episode *mod
 
 func (s *AutoWorkflowService) runEpisodeImageStage(runID uint, episode *models.Episode, progress int) error {
 	stage := workflowStageStoryboardImage
+	if err := s.ensureNotPaused(runID, stage, &episode.ID); err != nil {
+		return err
+	}
 	s.updateRun(runID, models.WorkflowRunStatusProcessing, s.stageWithEpisodeNumber(stage, episode.EpisodeNum), progress, "", nil)
 
 	targetCount, completedCount, err := s.getEpisodeImageProgress(episode.ID)
@@ -515,7 +604,7 @@ func (s *AutoWorkflowService) runEpisodeImageStage(runID uint, episode *models.E
 	if _, err := s.imageService.BatchGenerateImagesForEpisode(fmt.Sprintf("%d", episode.ID)); err != nil {
 		return err
 	}
-	if err := s.waitForEpisodeStoryboardImages(episode.ID, 20*time.Minute); err != nil {
+	if err := s.waitForEpisodeStoryboardImages(episode.ID, 20*time.Minute, runID, stage); err != nil {
 		return err
 	}
 
@@ -525,6 +614,9 @@ func (s *AutoWorkflowService) runEpisodeImageStage(runID uint, episode *models.E
 
 func (s *AutoWorkflowService) runEpisodeVideoStage(runID uint, episode *models.Episode, progress int) error {
 	stage := workflowStageStoryboardVideo
+	if err := s.ensureNotPaused(runID, stage, &episode.ID); err != nil {
+		return err
+	}
 	s.updateRun(runID, models.WorkflowRunStatusProcessing, s.stageWithEpisodeNumber(stage, episode.EpisodeNum), progress, "", nil)
 
 	targetCount, completedCount, err := s.getEpisodeVideoProgress(episode.ID)
@@ -540,7 +632,12 @@ func (s *AutoWorkflowService) runEpisodeVideoStage(runID uint, episode *models.E
 	if _, err := s.videoService.BatchGenerateVideosForEpisode(fmt.Sprintf("%d", episode.ID)); err != nil {
 		return err
 	}
-	if err := s.waitForEpisodeVideos(episode.ID, 35*time.Minute); err != nil {
+	if err := s.waitForEpisodeVideos(episode.ID, 35*time.Minute, runID, stage); err != nil {
+		// If upstream model不可用，暂停等待用户确认是否切换模型
+		if modelReq := s.buildModelSwitchRequest(episode.ID, err); modelReq != nil {
+			s.pauseForModelSwitch(runID, episode.ID, stage, modelReq)
+			return errWorkflowPaused
+		}
 		return err
 	}
 
@@ -550,6 +647,9 @@ func (s *AutoWorkflowService) runEpisodeVideoStage(runID uint, episode *models.E
 
 func (s *AutoWorkflowService) runEpisodeMergeStage(runID uint, episode *models.Episode, progress int) error {
 	stage := workflowStageEpisodeMerge
+	if err := s.ensureNotPaused(runID, stage, &episode.ID); err != nil {
+		return err
+	}
 	s.updateRun(runID, models.WorkflowRunStatusProcessing, s.stageWithEpisodeNumber(stage, episode.EpisodeNum), progress, "", nil)
 
 	s.updateStep(runID, &episode.ID, stage, models.WorkflowRunStatusProcessing, 10, fmt.Sprintf("Merging episode %d", episode.EpisodeNum), nil, nil)
@@ -567,7 +667,7 @@ func (s *AutoWorkflowService) runEpisodeMergeStage(runID uint, episode *models.E
 		return err
 	}
 
-	if err := s.waitForEpisodeMerge(mergeID, 20*time.Minute); err != nil {
+	if err := s.waitForEpisodeMerge(mergeID, 20*time.Minute, runID, stage, &episode.ID); err != nil {
 		return err
 	}
 	s.completeStage(runID, &episode.ID, stage, fmt.Sprintf("Episode %d merge completed", episode.EpisodeNum), nil)
@@ -607,6 +707,10 @@ func (s *AutoWorkflowService) ensureEpisodes(dramaID uint) ([]models.Episode, er
 		return nil, fmt.Errorf("drama description or metadata.full_script is required to auto-create episode")
 	}
 
+	if _, err := ValidateVideoScript(scriptContent); err != nil {
+		return nil, err
+	}
+
 	title := fmt.Sprintf("%s Episode 1", drama.Title)
 	episode := models.Episode{
 		DramaID:       dramaID,
@@ -623,9 +727,12 @@ func (s *AutoWorkflowService) ensureEpisodes(dramaID uint) ([]models.Episode, er
 	return []models.Episode{episode}, nil
 }
 
-func (s *AutoWorkflowService) waitForAsyncTask(taskID string, timeout time.Duration) (*models.AsyncTask, error) {
+func (s *AutoWorkflowService) waitForAsyncTask(taskID string, timeout time.Duration, runID uint, stage string, episodeID *uint) (*models.AsyncTask, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := s.ensureNotPaused(runID, stage, episodeID); err != nil {
+			return nil, err
+		}
 		task, err := s.taskService.GetTask(taskID)
 		if err != nil {
 			return nil, err
@@ -639,9 +746,12 @@ func (s *AutoWorkflowService) waitForAsyncTask(taskID string, timeout time.Durat
 	return nil, fmt.Errorf("task %s timeout", taskID)
 }
 
-func (s *AutoWorkflowService) waitForCharacterBaselines(dramaID uint, timeout time.Duration) error {
+func (s *AutoWorkflowService) waitForCharacterBaselines(dramaID uint, timeout time.Duration, runID uint, stage string) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := s.ensureNotPaused(runID, stage, nil); err != nil {
+			return err
+		}
 		var characters []models.Character
 		if err := s.db.Where("drama_id = ?", dramaID).Find(&characters).Error; err != nil {
 			return err
@@ -674,9 +784,12 @@ func (s *AutoWorkflowService) waitForCharacterBaselines(dramaID uint, timeout ti
 	return fmt.Errorf("character baseline generation timeout")
 }
 
-func (s *AutoWorkflowService) waitForEpisodeStoryboardImages(episodeID uint, timeout time.Duration) error {
+func (s *AutoWorkflowService) waitForEpisodeStoryboardImages(episodeID uint, timeout time.Duration, runID uint, stage string) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := s.ensureNotPaused(runID, stage, &episodeID); err != nil {
+			return err
+		}
 		targetCount, completedCount, err := s.getEpisodeImageProgress(episodeID)
 		if err != nil {
 			return err
@@ -694,7 +807,27 @@ func (s *AutoWorkflowService) waitForEpisodeStoryboardImages(episodeID uint, tim
 			Count(&pending).Error; err != nil {
 			return err
 		}
+
 		if pending == 0 && completedCount < targetCount {
+			var failedCount int64
+			if err := s.db.Model(&models.ImageGeneration{}).
+				Where("storyboard_id IN (?) AND status = ?", s.storyboardSubQuery(episodeID), models.ImageStatusFailed).
+				Count(&failedCount).Error; err != nil {
+				return err
+			}
+
+			if failedCount > 0 {
+				var latestFailed models.ImageGeneration
+				if err := s.db.Where("storyboard_id IN (?) AND status = ?", s.storyboardSubQuery(episodeID), models.ImageStatusFailed).
+					Order("updated_at DESC").
+					First(&latestFailed).Error; err == nil &&
+					latestFailed.ErrorMsg != nil &&
+					strings.TrimSpace(*latestFailed.ErrorMsg) != "" {
+					return fmt.Errorf("episode %d image generation failed for %d/%d storyboards: %s", episodeID, failedCount, targetCount, *latestFailed.ErrorMsg)
+				}
+				return fmt.Errorf("episode %d image generation failed for %d/%d storyboards", episodeID, failedCount, targetCount)
+			}
+
 			return fmt.Errorf("episode %d image generation incomplete", episodeID)
 		}
 		time.Sleep(5 * time.Second)
@@ -702,9 +835,12 @@ func (s *AutoWorkflowService) waitForEpisodeStoryboardImages(episodeID uint, tim
 	return fmt.Errorf("episode %d image generation timeout", episodeID)
 }
 
-func (s *AutoWorkflowService) waitForEpisodeVideos(episodeID uint, timeout time.Duration) error {
+func (s *AutoWorkflowService) waitForEpisodeVideos(episodeID uint, timeout time.Duration, runID uint, stage string) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := s.ensureNotPaused(runID, stage, &episodeID); err != nil {
+			return err
+		}
 		targetCount, completedCount, err := s.getEpisodeVideoProgress(episodeID)
 		if err != nil {
 			return err
@@ -722,7 +858,27 @@ func (s *AutoWorkflowService) waitForEpisodeVideos(episodeID uint, timeout time.
 			Count(&pending).Error; err != nil {
 			return err
 		}
+
 		if pending == 0 && completedCount < targetCount {
+			var failedCount int64
+			if err := s.db.Model(&models.VideoGeneration{}).
+				Where("storyboard_id IN (?) AND status = ?", s.storyboardSubQuery(episodeID), models.VideoStatusFailed).
+				Count(&failedCount).Error; err != nil {
+				return err
+			}
+
+			if failedCount > 0 {
+				var latestFailed models.VideoGeneration
+				if err := s.db.Where("storyboard_id IN (?) AND status = ?", s.storyboardSubQuery(episodeID), models.VideoStatusFailed).
+					Order("updated_at DESC").
+					First(&latestFailed).Error; err == nil &&
+					latestFailed.ErrorMsg != nil &&
+					strings.TrimSpace(*latestFailed.ErrorMsg) != "" {
+					return fmt.Errorf("episode %d video generation failed for %d/%d storyboards: %s", episodeID, failedCount, targetCount, *latestFailed.ErrorMsg)
+				}
+				return fmt.Errorf("episode %d video generation failed for %d/%d storyboards", episodeID, failedCount, targetCount)
+			}
+
 			return fmt.Errorf("episode %d video generation incomplete", episodeID)
 		}
 		time.Sleep(6 * time.Second)
@@ -730,9 +886,12 @@ func (s *AutoWorkflowService) waitForEpisodeVideos(episodeID uint, timeout time.
 	return fmt.Errorf("episode %d video generation timeout", episodeID)
 }
 
-func (s *AutoWorkflowService) waitForEpisodeMerge(mergeID uint, timeout time.Duration) error {
+func (s *AutoWorkflowService) waitForEpisodeMerge(mergeID uint, timeout time.Duration, runID uint, stage string, episodeID *uint) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		if err := s.ensureNotPaused(runID, stage, episodeID); err != nil {
+			return err
+		}
 		merge, err := s.videoMergeService.GetMerge(mergeID)
 		if err != nil {
 			return err
@@ -749,6 +908,143 @@ func (s *AutoWorkflowService) waitForEpisodeMerge(mergeID uint, timeout time.Dur
 		time.Sleep(5 * time.Second)
 	}
 	return fmt.Errorf("episode merge timeout")
+}
+
+func (s *AutoWorkflowService) buildModelSwitchRequest(episodeID uint, err error) *modelSwitchRequest {
+	if err == nil {
+		return nil
+	}
+	errMsg := err.Error()
+	if !isModelErrorMessage(errMsg) {
+		return nil
+	}
+
+	latest := s.latestVideoGenerationForEpisode(episodeID)
+	if latest == nil {
+		return nil
+	}
+	fallbacks := s.videoService.GetFallbackModels(latest.Provider, latest.Model)
+	available := s.videoService.ListAvailableVideoModels()
+
+	return &modelSwitchRequest{
+		Provider:       latest.Provider,
+		Model:          latest.Model,
+		FallbackModels: fallbacks,
+		Available:      available,
+		Reason:         errMsg,
+		EpisodeID:      episodeID,
+		Stage:          workflowStageStoryboardVideo,
+	}
+}
+
+func (s *AutoWorkflowService) pauseForModelSwitch(runID uint, episodeID uint, stage string, req *modelSwitchRequest) {
+	if req == nil {
+		return
+	}
+	episodeNum := s.getEpisodeNumber(episodeID)
+	stageWithNumber := s.stageWithEpisodeNumber(stage, episodeNum)
+	msg := fmt.Sprintf("Episode %d video generation paused: %s", episodeNum, req.Reason)
+	meta := map[string]interface{}{
+		"provider":              req.Provider,
+		"model":                 req.Model,
+		"fallback_models":       req.FallbackModels,
+		"available_models":      req.Available,
+		"reason":                req.Reason,
+		"episode_id":            episodeID,
+		"requires_confirmation": true,
+	}
+	now := time.Now()
+	// Pause both the generic stage and the episode-specific stage so前端都能感知
+	s.updateStep(runID, &episodeID, stage, models.WorkflowRunStatusPaused, 0, msg, fmt.Errorf(req.Reason), meta)
+	s.updateStep(runID, &episodeID, stageWithNumber, models.WorkflowRunStatusPaused, 0, msg, fmt.Errorf(req.Reason), meta)
+	resultJSON, _ := json.Marshal(meta)
+	_ = s.db.Model(&models.WorkflowRun{}).Where("id = ?", runID).Updates(map[string]interface{}{
+		"status":        models.WorkflowRunStatusPaused,
+		"current_stage": stageWithNumber,
+		"error_msg":     req.Reason,
+		"result_json":   datatypes.JSON(resultJSON),
+		"updated_at":    now,
+	}).Error
+}
+
+// Retry video generation for a specific episode with a chosen model (user confirmed model switch)
+func (s *AutoWorkflowService) RetryEpisodeVideoWithModel(dramaID string, episodeID uint, model string) error {
+	var drama models.Drama
+	if err := s.db.First(&drama, dramaID).Error; err != nil {
+		return err
+	}
+
+	var episode models.Episode
+	if err := s.db.Where("id = ? AND drama_id = ?", episodeID, drama.ID).First(&episode).Error; err != nil {
+		return err
+	}
+
+	var run models.WorkflowRun
+	if err := s.db.Where("drama_id = ? AND scope = ?", drama.ID, models.WorkflowRunScopeProject).
+		Order("created_at DESC").
+		First(&run).Error; err != nil {
+		return err
+	}
+
+	stage := workflowStageStoryboardVideo
+	stageWithNumber := s.stageWithEpisodeNumber(stage, episode.EpisodeNum)
+	message := fmt.Sprintf("Retrying storyboard videos for episode %d with model %s", episode.EpisodeNum, model)
+
+	s.updateRun(run.ID, models.WorkflowRunStatusProcessing, stageWithNumber, run.Progress, "", nil)
+	s.updateStep(run.ID, &episodeID, stage, models.WorkflowRunStatusProcessing, 10, message, nil, map[string]interface{}{
+		"model":    model,
+		"provider": "doubao",
+	})
+	s.updateStep(run.ID, &episodeID, stageWithNumber, models.WorkflowRunStatusProcessing, 10, message, nil, map[string]interface{}{
+		"model":    model,
+		"provider": "doubao",
+	})
+
+	if _, err := s.videoService.BatchGenerateVideosForEpisodeWithModel(fmt.Sprintf("%d", episodeID), model); err != nil {
+		return err
+	}
+
+	// Monitor asynchronously and mark completion/failure
+	go func() {
+		if err := s.waitForEpisodeVideos(episodeID, 35*time.Minute, run.ID, stage); err != nil {
+			if errors.Is(err, errWorkflowPaused) {
+				return
+			}
+			s.failRun(run.ID, stageWithNumber, err, &episodeID)
+			return
+		}
+		s.completeStage(run.ID, &episodeID, stage, fmt.Sprintf("Episode %d storyboard video generation completed", episode.EpisodeNum), nil)
+	}()
+
+	return nil
+}
+
+func (s *AutoWorkflowService) latestVideoGenerationForEpisode(episodeID uint) *models.VideoGeneration {
+	var vg models.VideoGeneration
+	if err := s.db.
+		Joins("JOIN storyboards ON storyboards.id = video_generations.storyboard_id").
+		Where("storyboards.episode_id = ?", episodeID).
+		Order("video_generations.updated_at DESC").
+		First(&vg).Error; err != nil {
+		return nil
+	}
+	return &vg
+}
+
+func isModelErrorMessage(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "api error") ||
+		strings.Contains(msg, "modelnotopen") ||
+		strings.Contains(msg, "gateway_error") ||
+		strings.Contains(msg, "服务内部错误")
+}
+
+func (s *AutoWorkflowService) getEpisodeNumber(episodeID uint) int {
+	var episode models.Episode
+	if err := s.db.Select("episode_number").Where("id = ?", episodeID).First(&episode).Error; err != nil {
+		return 0
+	}
+	return episode.EpisodeNum
 }
 
 func (s *AutoWorkflowService) getEpisodeImageProgress(episodeID uint) (int64, int64, error) {
@@ -874,7 +1170,78 @@ func (s *AutoWorkflowService) characterHasBaseline(character *models.Character) 
 	return true
 }
 
+func (s *AutoWorkflowService) getRunStatus(runID uint) (models.WorkflowRunStatus, error) {
+	var run models.WorkflowRun
+	if err := s.db.Select("status").Where("id = ?", runID).First(&run).Error; err != nil {
+		return "", err
+	}
+	return run.Status, nil
+}
+
+func (s *AutoWorkflowService) getRunProgress(runID uint) int {
+	var run models.WorkflowRun
+	if err := s.db.Select("progress").Where("id = ?", runID).First(&run).Error; err != nil {
+		return 0
+	}
+	return run.Progress
+}
+
+func (s *AutoWorkflowService) pauseActiveSteps(runID uint, stage string, episodeID *uint, progress int, message string) {
+	now := time.Now()
+	updates := map[string]interface{}{
+		"status":     models.WorkflowRunStatusPaused,
+		"progress":   progress,
+		"message":    message,
+		"updated_at": now,
+	}
+	if message == "" {
+		delete(updates, "message")
+	}
+	query := s.db.Model(&models.WorkflowStepRun{}).
+		Where("workflow_run_id = ? AND status IN ?", runID, []models.WorkflowRunStatus{
+			models.WorkflowRunStatusPending,
+			models.WorkflowRunStatusProcessing,
+		})
+	if stage != "" {
+		query = query.Where("stage = ?", stage)
+	}
+	if episodeID != nil {
+		query = query.Where("episode_id = ?", *episodeID)
+	}
+	_ = query.Updates(updates).Error
+}
+
+func (s *AutoWorkflowService) ensureNotPaused(runID uint, stage string, episodeID *uint) error {
+	status, err := s.getRunStatus(runID)
+	if err != nil {
+		return err
+	}
+	if status != models.WorkflowRunStatusPaused {
+		return nil
+	}
+	progress := s.getRunProgress(runID)
+	s.pauseActiveSteps(runID, stage, episodeID, progress, "Paused by user")
+	now := time.Now()
+	_ = s.db.Model(&models.WorkflowRun{}).Where("id = ?", runID).Updates(map[string]interface{}{
+		"status":        models.WorkflowRunStatusPaused,
+		"current_stage": stage,
+		"updated_at":    now,
+	}).Error
+	return errWorkflowPaused
+}
+
+func (s *AutoWorkflowService) isRunPaused(runID uint) bool {
+	status, err := s.getRunStatus(runID)
+	if err != nil {
+		return false
+	}
+	return status == models.WorkflowRunStatusPaused
+}
+
 func (s *AutoWorkflowService) updateRun(runID uint, status models.WorkflowRunStatus, stage string, progress int, message string, result map[string]interface{}) {
+	if status != models.WorkflowRunStatusPaused && s.isRunPaused(runID) {
+		return
+	}
 	updates := map[string]interface{}{
 		"status":        status,
 		"current_stage": stage,
@@ -893,6 +1260,9 @@ func (s *AutoWorkflowService) updateRun(runID uint, status models.WorkflowRunSta
 }
 
 func (s *AutoWorkflowService) updateStep(runID uint, episodeID *uint, stage string, status models.WorkflowRunStatus, progress int, message string, err error, meta map[string]interface{}) {
+	if status != models.WorkflowRunStatusPaused && s.isRunPaused(runID) {
+		return
+	}
 	var step models.WorkflowStepRun
 	query := s.db.Where("workflow_run_id = ? AND stage = ?", runID, stage)
 	if episodeID != nil {

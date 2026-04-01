@@ -97,6 +97,12 @@ func (s *VideoGenerationService) GenerateVideo(request *GenerateVideoRequest) (*
 	if provider == "" {
 		provider = "doubao"
 	}
+	model := request.Model
+	// Allow user-specified model override; otherwise resolve later
+	resolvedModel := s.resolveVideoModel(provider, model)
+	if model == "" {
+		model = resolvedModel
+	}
 
 	dramaID, _ := strconv.ParseUint(request.DramaID, 10, 32)
 
@@ -106,7 +112,7 @@ func (s *VideoGenerationService) GenerateVideo(request *GenerateVideoRequest) (*
 		ImageGenID:   request.ImageGenID,
 		Provider:     provider,
 		Prompt:       request.Prompt,
-		Model:        request.Model,
+		Model:        model,
 		Duration:     request.Duration,
 		FPS:          request.FPS,
 		AspectRatio:  request.AspectRatio,
@@ -202,7 +208,30 @@ func (s *VideoGenerationService) ProcessVideoGeneration(videoGenID uint) {
 
 	s.db.Model(&videoGen).Update("status", models.VideoStatusProcessing)
 
-	client, err := s.getVideoClient(videoGen.Provider, videoGen.Model)
+	// Resolve model from config when request didn't specify one
+	resolvedModel := s.resolveVideoModel(videoGen.Provider, videoGen.Model)
+	if resolvedModel != "" && videoGen.Model == "" {
+		// Persist the resolved model for transparency/debugging
+		_ = s.db.Model(&models.VideoGeneration{}).Where("id = ?", videoGenID).Update("model", resolvedModel).Error
+		videoGen.Model = resolvedModel
+	}
+
+	// Apply provider/model specific constraints (e.g., duration caps)
+	if constraints, fallbackMax := s.getVideoConstraints(videoGen.Provider, resolvedModel); videoGen.Duration != nil {
+		maxAllowed := constraintsMaxDuration(constraints, fallbackMax)
+		if maxAllowed > 0 && *videoGen.Duration > maxAllowed {
+			s.log.Warnw("Clamping video duration to provider/model limit",
+				"id", videoGenID,
+				"requested_duration", *videoGen.Duration,
+				"clamped_duration", maxAllowed,
+				"provider", videoGen.Provider,
+				"model", resolvedModel)
+			videoGen.Duration = &maxAllowed
+			_ = s.db.Model(&models.VideoGeneration{}).Where("id = ?", videoGenID).Update("duration", maxAllowed).Error
+		}
+	}
+
+	client, err := s.getVideoClient(videoGen.Provider, resolvedModel)
 	if err != nil {
 		s.log.Errorw("Failed to get video client", "error", err, "provider", videoGen.Provider, "model", videoGen.Model)
 		s.updateVideoGenError(videoGenID, err.Error())
@@ -594,6 +623,237 @@ func normalizeVideoProvider(provider string) string {
 	return strings.ToLower(strings.TrimSpace(provider))
 }
 
+type VideoConstraintConfig struct {
+	MaxDuration   *int     `json:"max_duration"`
+	MinResolution string   `json:"min_resolution"`
+	ReferenceMode []string `json:"reference_modes"`
+}
+
+type VideoFallbackConfig struct {
+	VideoFallbacks []string `json:"video_fallbacks"`
+}
+
+func (s *VideoGenerationService) resolveVideoModel(provider string, model string) string {
+	if model != "" {
+		return model
+	}
+
+	config, err := s.aiService.GetPreferredConfig("video", provider, model)
+	if err != nil || config == nil || len(config.Model) == 0 {
+		return model
+	}
+	return config.Model[0]
+}
+
+// maxDurationForProvider returns the maximum duration (in seconds) supported by the given provider/model.
+// It keeps requests within provider limits to avoid hard failures (e.g. Doubao seedance i2v returns 500 when >8s).
+func maxDurationForProvider(provider string, model string) (int, bool) {
+	p := normalizeVideoProvider(provider)
+	m := strings.ToLower(model)
+
+	// Doubao/Volc Ark Seedance i2v models are limited to short clips (<=8s).
+	if (p == "doubao" || p == "volcengine" || p == "volces" || p == "ark" || p == "chatfire") &&
+		(strings.Contains(m, "i2v") || strings.Contains(m, "seedance")) {
+		return 8, true
+	}
+
+	return 0, false
+}
+
+func (s *VideoGenerationService) getVideoConstraints(provider string, model string) (*VideoConstraintConfig, int) {
+	// Try to load constraints from AI config settings
+	config, err := s.aiService.GetPreferredConfig("video", provider, model)
+	if err == nil && config != nil && strings.TrimSpace(config.Settings) != "" {
+		if constraints := parseVideoConstraintSettings(config.Settings, model); constraints != nil {
+			return constraints, 0
+		}
+	}
+
+	// Fallback heuristic constraints
+	if maxDur, ok := maxDurationForProvider(provider, model); ok {
+		return nil, maxDur
+	}
+	return nil, 0
+}
+
+func parseVideoConstraintSettings(settings string, model string) *VideoConstraintConfig {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		model = "default"
+	}
+
+	type constraintMap struct {
+		VideoConstraints map[string]VideoConstraintConfig `json:"video_constraints"`
+	}
+
+	// 1. Try structured map { "video_constraints": { "model": {...}, "default": {...} } }
+	var data constraintMap
+	if err := json.Unmarshal([]byte(settings), &data); err == nil && len(data.VideoConstraints) > 0 {
+		if cfg, ok := data.VideoConstraints[model]; ok {
+			if base, okBase := data.VideoConstraints["default"]; okBase {
+				return mergeConstraintConfig(base, cfg)
+			}
+			return &cfg
+		}
+		if base, ok := data.VideoConstraints["default"]; ok {
+			return &base
+		}
+	}
+
+	// 2. Try direct map form { "model": {...}, "default": {...} }
+	var simple map[string]VideoConstraintConfig
+	if err := json.Unmarshal([]byte(settings), &simple); err == nil && len(simple) > 0 {
+		if cfg, ok := simple[model]; ok {
+			if base, okBase := simple["default"]; okBase {
+				return mergeConstraintConfig(base, cfg)
+			}
+			return &cfg
+		}
+		if base, ok := simple["default"]; ok {
+			return &base
+		}
+	}
+
+	return nil
+}
+
+func mergeConstraintConfig(base VideoConstraintConfig, override VideoConstraintConfig) *VideoConstraintConfig {
+	result := base
+	if override.MaxDuration != nil {
+		result.MaxDuration = override.MaxDuration
+	}
+	if override.MinResolution != "" {
+		result.MinResolution = override.MinResolution
+	}
+	if len(override.ReferenceMode) > 0 {
+		result.ReferenceMode = override.ReferenceMode
+	}
+	return &result
+}
+
+func constraintsMaxDuration(cfg *VideoConstraintConfig, fallback int) int {
+	if cfg != nil && cfg.MaxDuration != nil {
+		return *cfg.MaxDuration
+	}
+	return fallback
+}
+
+// GetFallbackModels returns a list of alternative models (order preserved) for the given provider/model.
+// Priority: 1) video_fallbacks in AI config settings; 2) other active video configs for the same provider; 3) other active video configs of any provider.
+func (s *VideoGenerationService) GetFallbackModels(provider string, model string) []string {
+	var fallbacks []string
+
+	// 1) From settings.video_fallbacks
+	if config, err := s.aiService.GetPreferredConfig("video", provider, model); err == nil && config != nil && strings.TrimSpace(config.Settings) != "" {
+		if parsed := parseVideoFallbacks(config.Settings); len(parsed) > 0 {
+			fallbacks = append(fallbacks, parsed...)
+		}
+	}
+
+	// 2) Other configs same provider
+	if configs, err := s.aiService.ListConfigs("video"); err == nil {
+		normalizedProvider := normalizeVideoProvider(provider)
+		for _, cfg := range configs {
+			if !cfg.IsActive {
+				continue
+			}
+			if normalizeVideoProvider(cfg.Provider) != normalizedProvider {
+				continue
+			}
+			for _, m := range cfg.Model {
+				if strings.EqualFold(m, model) {
+					continue
+				}
+				if !containsStringCaseInsensitive(fallbacks, m) {
+					fallbacks = append(fallbacks, m)
+				}
+			}
+		}
+
+		// 3) Other providers (as a last resort)
+		for _, cfg := range configs {
+			if !cfg.IsActive {
+				continue
+			}
+			if normalizeVideoProvider(cfg.Provider) == normalizedProvider {
+				continue
+			}
+			for _, m := range cfg.Model {
+				if strings.EqualFold(m, model) {
+					continue
+				}
+				if !containsStringCaseInsensitive(fallbacks, m) {
+					fallbacks = append(fallbacks, m)
+				}
+			}
+		}
+	}
+
+	return fallbacks
+}
+
+// ListAvailableVideoModels returns a unique list of all active video models across providers.
+func (s *VideoGenerationService) ListAvailableVideoModels() []string {
+	var models []string
+	configs, err := s.aiService.ListConfigs("video")
+	if err != nil {
+		return models
+	}
+	for _, cfg := range configs {
+		if !cfg.IsActive {
+			continue
+		}
+		for _, m := range cfg.Model {
+			if !containsStringCaseInsensitive(models, m) {
+				models = append(models, m)
+			}
+		}
+	}
+	return models
+}
+
+func parseVideoFallbacks(settings string) []string {
+	if strings.TrimSpace(settings) == "" {
+		return nil
+	}
+
+	var cfg VideoFallbackConfig
+	if err := json.Unmarshal([]byte(settings), &cfg); err == nil && len(cfg.VideoFallbacks) > 0 {
+		return cfg.VideoFallbacks
+	}
+
+	// Also try to unmarshal into a generic map in case settings is a flat object
+	var generic map[string]interface{}
+	if err := json.Unmarshal([]byte(settings), &generic); err == nil {
+		if raw, ok := generic["video_fallbacks"]; ok {
+			switch v := raw.(type) {
+			case []interface{}:
+				var list []string
+				for _, item := range v {
+					if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+						list = append(list, s)
+					}
+				}
+				if len(list) > 0 {
+					return list
+				}
+			case []string:
+				return v
+			}
+		}
+	}
+	return nil
+}
+
+func containsStringCaseInsensitive(list []string, target string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, target) {
+			return true
+		}
+	}
+	return false
+}
+
 func isChatfireVideoEndpoint(endpoint string) bool {
 	normalized := strings.ToLower(endpoint)
 	return strings.Contains(normalized, "/video/generations") || strings.Contains(normalized, "/video/task")
@@ -728,6 +988,10 @@ func (s *VideoGenerationService) ListVideoGenerations(dramaID *uint, storyboardI
 }
 
 func (s *VideoGenerationService) GenerateVideoFromImage(imageGenID uint) (*models.VideoGeneration, error) {
+	return s.generateVideoFromImageWithModel(imageGenID, "")
+}
+
+func (s *VideoGenerationService) generateVideoFromImageWithModel(imageGenID uint, model string) (*models.VideoGeneration, error) {
 	var imageGen models.ImageGeneration
 	if err := s.db.First(&imageGen, imageGenID).Error; err != nil {
 		return nil, fmt.Errorf("image generation not found")
@@ -756,6 +1020,7 @@ func (s *VideoGenerationService) GenerateVideoFromImage(imageGenID uint) (*model
 		ImageURL:     *imageGen.ImageURL,
 		Prompt:       imageGen.Prompt,
 		Provider:     "doubao",
+		Model:        model,
 		Duration:     duration,
 	}
 
@@ -763,6 +1028,14 @@ func (s *VideoGenerationService) GenerateVideoFromImage(imageGenID uint) (*model
 }
 
 func (s *VideoGenerationService) BatchGenerateVideosForEpisode(episodeID string) ([]*models.VideoGeneration, error) {
+	return s.batchGenerateVideosForEpisodeWithModel(episodeID, "")
+}
+
+func (s *VideoGenerationService) BatchGenerateVideosForEpisodeWithModel(episodeID string, model string) ([]*models.VideoGeneration, error) {
+	return s.batchGenerateVideosForEpisodeWithModel(episodeID, model)
+}
+
+func (s *VideoGenerationService) batchGenerateVideosForEpisodeWithModel(episodeID string, model string) ([]*models.VideoGeneration, error) {
 	var episode models.Episode
 	if err := s.db.Preload("Storyboards").Where("id = ?", episodeID).First(&episode).Error; err != nil {
 		return nil, fmt.Errorf("episode not found")
@@ -782,7 +1055,7 @@ func (s *VideoGenerationService) BatchGenerateVideosForEpisode(episodeID string)
 			continue
 		}
 
-		videoGen, err := s.GenerateVideoFromImage(imageGen.ID)
+		videoGen, err := s.generateVideoFromImageWithModel(imageGen.ID, model)
 		if err != nil {
 			s.log.Errorw("Failed to generate video", "storyboard_id", storyboard.ID, "error", err)
 			continue

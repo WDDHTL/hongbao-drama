@@ -71,7 +71,9 @@ func SetupRouter(cfg *config.Config, db *gorm.DB, log *logger.Logger, localStora
 			dramas.DELETE("/:id", dramaHandler.DeleteDrama)
 			dramas.GET("/:id/workflow", workflowHandler.GetProjectWorkflowStatus)
 			dramas.POST("/:id/workflow/start", workflowHandler.StartProjectWorkflow)
+			dramas.POST("/:id/workflow/pause", workflowHandler.PauseProjectWorkflow)
 			dramas.POST("/:id/workflow/resume", workflowHandler.ResumeProjectWorkflow)
+			dramas.POST("/:id/workflow/retry-video", workflowHandler.RetryEpisodeVideo)
 
 			dramas.PUT("/:id/outline", dramaHandler.SaveOutline)
 			dramas.GET("/:id/characters", dramaHandler.GetCharacters)

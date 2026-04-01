@@ -258,7 +258,8 @@ const visible = computed({
   set: (val) => emit('update:modelValue', val)
 })
 
-const activeTab = ref<AIServiceType>('text')
+// 默认展示视频模型，方便直接查看/切换视频配置
+const activeTab = ref<AIServiceType>('video')
 const loading = ref(false)
 const configs = ref<AIServiceConfig[]>([])
 const editDialogVisible = ref(false)
@@ -580,12 +581,18 @@ const handleQuickSetup = async () => {
   }
 }
 
-watch(visible, (val) => {
-  if (val) {
-    resetForm()
-    loadConfigs()
-  }
-})
+watch(
+  visible,
+  (val) => {
+    if (val) {
+      // 每次打开都优先切到视频配置，便于快速查看/切换视频模型
+      activeTab.value = 'video'
+      resetForm()
+      loadConfigs()
+    }
+  },
+  { immediate: true }
+)
 </script>
 
 <style scoped>

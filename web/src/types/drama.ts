@@ -124,6 +124,7 @@ export interface CreateDramaRequest {
   style?: string
   video_language?: string
   tags?: string
+  metadata?: any
 }
 
 export interface UpdateDramaRequest {
@@ -134,6 +135,7 @@ export interface UpdateDramaRequest {
   video_language?: string
   tags?: string
   status?: DramaStatus
+  metadata?: any
 }
 
 export interface DramaListQuery {
